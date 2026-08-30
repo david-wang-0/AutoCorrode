@@ -37,6 +37,9 @@ class MCPBridgeWithReconnect:
         )
         self._recv_buffer = b""
         self._response_queue: List[Dict[str, Any]] = []
+        # LOCAL PATCH (auto-auth) -- see iq/NOTE-FOR-AGENT-iq-bridge-auto-auth.md
+        self._auth_done = False
+        self._auth_attempted = False
 
     def _set_forward_error(self, message: str) -> None:
         self.last_forward_error = message.strip() if message else None
@@ -169,6 +172,10 @@ class MCPBridgeWithReconnect:
             self.connected = True
             self._recv_buffer = b""
             self._response_queue = []
+            # LOCAL PATCH (auto-auth): authentication is scoped to the TCP
+            # connection, so a fresh socket is always unauthenticated.
+            self._auth_done = False
+            self._auth_attempted = False
             self.log(
                 f"Connected to Isabelle MCP server at {self.server_host}:{self.server_port} "
                 f"(response timeout: {self.response_timeout_sec:.0f}s)"
@@ -199,6 +206,77 @@ class MCPBridgeWithReconnect:
         self.log("Connection lost, attempting to reconnect...")
         return self.connect_to_isabelle()
 
+    # ---- LOCAL PATCH (auto-auth) -------------------------------------------
+    # See iq/NOTE-FOR-AGENT-iq-bridge-auto-auth.md before changing or dropping.
+
+    _AUTH_REQUEST_ID = "iq-bridge-auto-auth"
+
+    def _is_auth_call(self, request: Dict[str, Any]) -> bool:
+        """True if the client is calling the `authenticate` tool itself."""
+        params = request.get("params")
+        if not isinstance(params, dict):
+            return False
+        return params.get("name") == "authenticate"
+
+    def _ensure_authenticated(self) -> None:
+        """Authenticate this socket before the first tool call made over it.
+
+        The I/Q server scopes authentication to the TCP connection, so every
+        reconnect (notably after a jEdit restart) silently drops it. Doing it
+        here means the MCP client never has to: no `authenticate` tool call, and
+        a reconnect heals itself instead of surfacing one failed call.
+
+        Deliberately lazy rather than done in `connect_to_isabelle`: a tool call
+        only happens after the client's MCP `initialize`, so this cannot race
+        ahead of the handshake.
+
+        Best-effort by design -- every failure path just logs and returns, and
+        the caller's request is forwarded regardless so the server's own error
+        surfaces normally.
+        """
+        if self._auth_done or self._auth_attempted:
+            return
+        self._auth_attempted = True
+
+        token = os.environ.get("IQ_AUTH_TOKEN", "")
+        if not token:
+            self.log("Auto-auth: IQ_AUTH_TOKEN unset or empty, skipping")
+            return
+
+        request = {
+            "jsonrpc": "2.0",
+            "id": self._AUTH_REQUEST_ID,
+            "method": "tools/call",
+            "params": {"name": "authenticate", "arguments": {"token": token}},
+        }
+        try:
+            payload = (json.dumps(request) + "\n").encode()
+            if hasattr(self.isabelle_socket, "sendall"):
+                self.isabelle_socket.sendall(payload)
+            else:
+                self.isabelle_socket.send(payload)
+            # Reuses the shared recv buffer/queue, so any interleaved server
+            # messages stay queued for their own requests rather than being eaten.
+            response = self._read_response_for_id(
+                "tools/call (auto-auth)",
+                self._AUTH_REQUEST_ID,
+                min(30.0, self.response_timeout_sec),
+            )
+        except Exception as e:
+            self.log(f"Auto-auth: send failed ({e})")
+            return
+
+        if response is None:
+            self.log("Auto-auth: no response from server")
+        elif response.get("error"):
+            # Never log the response body -- it can echo the submitted token.
+            self.log("Auto-auth: rejected by server (stale or wrong IQ_AUTH_TOKEN?)")
+        else:
+            self._auth_done = True
+            self.log("Auto-auth: authenticated")
+
+    # ---- end LOCAL PATCH ---------------------------------------------------
+
     def forward_to_isabelle(self, request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Forward request to Isabelle server with automatic reconnection."""
         method = request.get('method', 'unknown')
@@ -210,6 +288,14 @@ class MCPBridgeWithReconnect:
         if not self.ensure_connection():
             self.log(f"Cannot establish connection - cannot forward {method}")
             return None
+
+        # LOCAL PATCH (auto-auth): authenticate the connection before its first
+        # tool call. If the client authenticates itself, stand aside.
+        if method == "tools/call":
+            if self._is_auth_call(request):
+                self._auth_attempted = True
+            else:
+                self._ensure_authenticated()
 
         try:
             # Send request
