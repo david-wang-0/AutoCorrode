@@ -14,13 +14,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-awk '
-  /val tools = List\(/ { in_tools = 1 }
-  in_tools { print }
-  /val result = Map\("tools" -> tools\)/ { in_tools = 0 }
-' "$SERVER_FILE" \
-  | sed -nE 's/.*"name"[[:space:]]*->[[:space:]]*"([^"]+)".*/\1/p' \
-  | sort -u > "$tmp_server_tools"
+# The registry is the iqToolSchemas val (ends where iqToolHandlers begins).
+# `authenticate` is a built-in of the generic McpServer and not listed there,
+# but the README documents it, so it is added explicitly.
+{
+  awk '
+    /private val iqToolSchemas/ { in_tools = 1 }
+    /private val iqToolHandlers/ { in_tools = 0 }
+    in_tools { print }
+  ' "$SERVER_FILE" \
+    | sed -nE 's/^[[:space:]]*"name"[[:space:]]*->[[:space:]]*"([^"]+)".*/\1/p'
+  echo authenticate
+} | sort -u > "$tmp_server_tools"
 
 # Capture the README's MCP Tools section up to (but excluding) the I/R REPL
 # subsection. The server registry compared below likewise excludes REPL tools
