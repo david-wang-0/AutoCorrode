@@ -1,0 +1,7 @@
+session Stall_Test = HOL +
+  description "Chain A -> B -> C -> D for I/Q stall detection: uncomment foo_loop in A to make D's simp spin forever."
+  theories [document = false]
+    A
+    B
+    C
+    D

@@ -349,7 +349,9 @@ class IQServer(
 
   private final case class GetCommandCoreResult(
     commandsData: List[Map[String, Any]],
-    summary: Map[String, Any]
+    summary: Map[String, Any],
+    waitStalled: Boolean,
+    runningCommands: List[Map[String, Any]]
   )
 
   private final case class TrackedFileEntry(
@@ -393,18 +395,101 @@ class IQServer(
     inView: Boolean
   )
 
+  /** Outcome of a bounded wait for theory processing (see waitForTheoryCompletion). */
+  private final case class TheoryWaitOutcome(
+    completed: Boolean,
+    timedOut: Boolean,
+    stalled: Boolean,
+    elapsedMs: Long,
+    status: Document_Status.Node_Status,
+    runningCommands: List[Map[String, Any]]
+  ) {
+    def toMap: Map[String, Any] = Map(
+      "completed" -> completed,
+      "timed_out" -> timedOut,
+      "stalled" -> stalled,
+      "elapsed_ms" -> elapsedMs,
+      "running_commands" -> runningCommands
+    )
+  }
+
+  /** Poll interval of the wait loops; also bounds how late a stall is noticed. */
+  private val waitTickMs: Long = 250L
+
+  /** First 80 characters of a command source, newlines collapsed to spaces. */
+  private def sourcePreview(source: String): String =
+    source.replaceAll("\\R+", " ").take(80)
+
+  /**
+   * Commands of the theory whose evaluation is currently running, with their
+   * position and how long they have been running. Empty when nothing runs.
+   * A single entry that keeps growing in elapsed_ms is typically a diverging
+   * proof method; cancel_command interrupts it.
+   */
+  /** When each (node, command) was first observed running by any stall probe.
+    * PIDE's per-command timings only cover the command's own evaluation; a
+    * terminal proof forked by the prover (the interactive default) shows no
+    * running interval there, so `elapsed_ms` from timings alone reads 0 for
+    * exactly the diverging `by simp` we want to expose. Entries are dropped as
+    * soon as the command is seen not running. */
+  private val runningSince =
+    new java.util.concurrent.ConcurrentHashMap[(Document.Node.Name, Document_ID.Command), Long]()
+
+  private def runningCommandsInfo(model: Document_Model): List[Map[String, Any]] =
+    runningCommandsInfo(model.node_name)
+
+  private def runningCommandsInfo(node_name: Document.Node.Name): List[Map[String, Any]] = {
+    val snapshot = PIDE.session.snapshot(node_name = node_name)
+    val node = snapshot.get_node(node_name)
+    if (node == null) List.empty
+    else {
+      val now = Date.now()
+      val nowMs = System.currentTimeMillis()
+      node.commands.iterator.flatMap { cmd =>
+        val status = snapshot.state.command_status(snapshot.version, cmd)
+        val key = (node_name, cmd.id)
+        if (!status.is_running) {
+          runningSince.remove(key)
+          None
+        } else {
+          val firstSeen = runningSince.computeIfAbsent(key, _ => nowMs)
+          val timedMs =
+            status.timings.long_running(now, Time.zero).map(_.time(now).ms).foldLeft(0L)(_ max _)
+          Some(Map[String, Any](
+            "line" -> node.command_start_line(cmd).getOrElse(0),
+            "offset" -> node.command_start(cmd).getOrElse(0),
+            "elapsed_ms" -> (timedMs max (nowMs - firstSeen)),
+            "source_preview" -> sourcePreview(cmd.source)
+          ))
+        }
+      }.toList
+    }
+  }
+
+  /** Node-level count of running commands, for the stall detectors. */
+  private def runningCommandCount(node_name: Document.Node.Name): Int = {
+    val snapshot = PIDE.session.snapshot(node_name = node_name)
+    Document_Status.Node_Status.make(Date.now(), snapshot.state, snapshot.version, node_name).running
+  }
+
   /**
    * Waits for a theory to be fully processed by marking it as required and polling until completion.
    *
+   * The wait is bounded by `timeout_ms` overall and by a stall detector: if
+   * `timeoutPerCommandMs` is set, at least one command is running and PIDE has
+   * reported no change for the theory for that long, the wait returns early
+   * with `stalled = true` and the running commands listed.
+   *
    * @param model The document model for the theory
-   * @param timeoutMs Maximum time to wait in milliseconds
-   * @return A tuple containing (completion_succeeded, final_status)
+   * @param timeout_ms Maximum time to wait in milliseconds (default 30000)
+   * @param timeoutPerCommandMs Stall detector threshold in milliseconds
+   * @return The outcome (completion flags, elapsed time, final status, running commands)
    */
   private def waitForTheoryCompletion(
     model: Document_Model,
     timeout_ms: Option[Int],
     timeoutPerCommandMs: Option[Int] = None
-  ): (Boolean, Document_Status.Node_Status) = {
+  ): TheoryWaitOutcome = {
 
     val startTime = System.currentTimeMillis()
     val node_name = model.node_name
@@ -434,79 +519,106 @@ class IQServer(
     // Get initial status
     @volatile var currentStatus = getNodeStatus()
     var completed = isCompleted(currentStatus)
+    var timedOut = false
+    var stalled = false
+    // How long PIDE had been silent when the stall was declared: a lower bound on
+    // how long the running command has been spinning, used to floor elapsed_ms
+    // (a forked proof observed for the first time here would otherwise read 0).
+    var quietAtStallMs = 0L
 
-    if (!completed) {
-      val latch = new CountDownLatch(1)
-      var checkCount = 0
-      var perCommandTimerStart: Option[Long] = None
+    try {
+      if (!completed) {
+        val latch = new CountDownLatch(1)
+        var checkCount = 0
+        @volatile var lastEventAtMs = System.currentTimeMillis()
 
-      val consumer = Session.Consumer[Session.Commands_Changed](
-        "IQServer.waitForTheoryCompletion"
-      ) {
-        case Session.Commands_Changed(_, nodes, _) if nodes.contains(node_name) =>
-          checkCount += 1
-          currentStatus = getNodeStatus()
+        val consumer = Session.Consumer[Session.Commands_Changed](
+          "IQServer.waitForTheoryCompletion"
+        ) {
+          case Session.Commands_Changed(_, nodes, _) if nodes.contains(node_name) =>
+            checkCount += 1
+            lastEventAtMs = System.currentTimeMillis()
+            currentStatus = getNodeStatus()
 
-          if (isCompleted(currentStatus)) {
-            Output.writeln(s"I/Q Server: Theory completion achieved after $checkCount checks")
-            latch.countDown()
-          } else {
-            // Per-command timeout logic
-            if (currentStatus.unprocessed == 0 && perCommandTimerStart.isEmpty) {
-              perCommandTimerStart = Some(System.currentTimeMillis())
-              Output.writeln(s"I/Q Server: All commands processed, starting per-command timer for running commands")
-            }
-
-            timeoutPerCommandMs match {
-              case Some(perCmdTimeout) =>
-                perCommandTimerStart match {
-                  case Some(timerStart) =>
-                    val perCommandElapsed = System.currentTimeMillis() - timerStart
-                    if (perCommandElapsed >= perCmdTimeout) {
-                      Output.writeln(s"I/Q Server: Per-command timeout of ${perCmdTimeout}ms exceeded (${perCommandElapsed}ms elapsed), aborting")
-                      latch.countDown()
-                    }
-                  case None =>
-                }
-              case None =>
-            }
-
-            // Log progress every 50 checks (~5 seconds at 100ms event interval)
-            if (checkCount % 50 == 0) {
+            if (isCompleted(currentStatus)) {
+              Output.writeln(s"I/Q Server: Theory completion achieved after $checkCount checks")
+              latch.countDown()
+            } else if (checkCount % 50 == 0) {
+              // Log progress every 50 checks (~5 seconds at 100ms event interval)
               Output.writeln(s"I/Q Server: Theory completion progress - unprocessed: ${currentStatus.unprocessed}, running: ${currentStatus.running}, finished: ${currentStatus.finished}, failed: ${currentStatus.failed}, terminated: ${currentStatus.terminated}, consolidated: ${currentStatus.consolidated}")
             }
-          }
-        case _ =>
-      }
-
-      PIDE.session.commands_changed += consumer
-      try {
-        // Re-check after subscribing to avoid TOCTOU race
-        currentStatus = getNodeStatus()
-        if (isCompleted(currentStatus)) {
-          latch.countDown()
+          case _ =>
         }
-        val timeoutVal = timeout_ms.getOrElse(30000).toLong
-        val awaitResult = latch.await(timeoutVal, TimeUnit.MILLISECONDS)
-        completed = awaitResult || isCompleted(currentStatus)
-      } finally {
-        PIDE.session.commands_changed -= consumer
+
+        PIDE.session.commands_changed += consumer
+        try {
+          // Re-check after subscribing to avoid TOCTOU race
+          currentStatus = getNodeStatus()
+          if (isCompleted(currentStatus)) {
+            latch.countDown()
+          }
+          val deadline = startTime + timeout_ms.getOrElse(30000).toLong
+
+          // Tick loop. The stall check deliberately lives here, on a timer,
+          // and not inside the event consumer: a silently diverging method
+          // emits no Commands_Changed events at all, and a diverging
+          // non-forked step keeps the rest of the theory unprocessed forever,
+          // so neither an event-driven check nor one gated on
+          // `unprocessed == 0` would ever fire.
+          var waiting = true
+          while (waiting) {
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining <= 0L) {
+              timedOut = true
+              waiting = false
+            } else if (latch.await(math.min(waitTickMs, remaining), TimeUnit.MILLISECONDS)) {
+              waiting = false
+            } else {
+              currentStatus = getNodeStatus()
+              if (isCompleted(currentStatus)) {
+                waiting = false
+              } else {
+                timeoutPerCommandMs.foreach { perCmdTimeout =>
+                  val quietMs = System.currentTimeMillis() - lastEventAtMs
+                  if (currentStatus.running >= 1 && quietMs >= perCmdTimeout) {
+                    Output.writeln(s"I/Q Server: Stall detected - ${currentStatus.running} command(s) running and no PIDE change for ${quietMs}ms (threshold ${perCmdTimeout}ms), aborting wait")
+                    stalled = true
+                    quietAtStallMs = quietMs
+                    waiting = false
+                  }
+                }
+              }
+            }
+          }
+          completed = isCompleted(currentStatus)
+          if (completed) timedOut = false
+        } finally {
+          PIDE.session.commands_changed -= consumer
+        }
+      }
+    } finally {
+      // Restore the original required state
+      GUI_Thread.now {
+        Document_Model.node_required(node_name, set = originalRequiredState)
       }
     }
 
     val elapsedMs = System.currentTimeMillis() - startTime
     if (completed) {
       Output.writeln(s"I/Q Server: Theory completion succeeded after ${elapsedMs}ms")
+    } else if (stalled) {
+      Output.writeln(s"I/Q Server: Theory completion wait stalled after ${elapsedMs}ms")
     } else {
       Output.writeln(s"I/Q Server: Theory completion timed out after ${elapsedMs}ms")
     }
 
-    // Restore the original required state
-    GUI_Thread.now {
-      Document_Model.node_required(node_name, set = originalRequiredState)
-    }
-
-    (completed, currentStatus)
+    val runningCommands =
+      if (completed) List.empty
+      else runningCommandsInfo(model).map { entry =>
+        val seen = entry.get("elapsed_ms").collect { case n: Long => n }.getOrElse(0L)
+        entry + ("elapsed_ms" -> (seen max quietAtStallMs))
+      }
+    TheoryWaitOutcome(completed, timedOut, stalled, elapsedMs, currentStatus, runningCommands)
   }
 
   /**
@@ -754,7 +866,8 @@ class IQServer(
             ),
             "timeout_per_command" -> Map(
               "type" -> "integer",
-              "description" -> "Per-command running grace period in milliseconds when wait_until_processed=true. Default: 5000."
+              "description" -> ("Stall detector: if a command is running and PIDE reports no change for this many ms, " +
+                "the wait returns early with stalled=true and lists running_commands. Default: 5000.")
             ),
             "include_results" -> Map(
               "type" -> "boolean",
@@ -798,7 +911,10 @@ class IQServer(
             ),
             "timeout_per_command" -> Map(
               "type" -> "integer",
-              "description" -> "Per-command running grace period in milliseconds when wait_until_processed=true. Default: 5000."
+              "description" -> ("Stall detector: if a command is running and PIDE reports no change for this many ms, " +
+                "the wait returns early with stalled=true and lists running_commands. Default: 5000. " +
+                "Only THIS theory is watched: PIDE forks terminal proofs, so a diverging method in an imported theory " +
+                "does not block this one and goes unnoticed here; wait on (or check get_processing_status of) the import itself.")
             )
           ),
           "required" -> List("path"),
@@ -932,7 +1048,8 @@ class IQServer(
             ),
             "timeout_per_command" -> Map(
               "type" -> "integer",
-              "description" -> "Per-command running grace period in milliseconds when wait_until_processed=true. Default: 5000."
+              "description" -> ("Stall detector: if a command is running and PIDE reports no change for this many ms, " +
+                "the wait returns early with stalled=true and lists running_commands. Default: 5000.")
             ),
             "check_context_scope" -> Map(
               "type" -> "string",
@@ -1203,7 +1320,10 @@ class IQServer(
             ),
             "timeout_per_command" -> Map(
               "type" -> "integer",
-              "description" -> "Per-command running grace period in milliseconds when wait_until_processed=true. Default: 5000."
+              "description" -> ("Stall detector: if a command is running and PIDE reports no change for this many ms, " +
+                "the wait returns early with stalled=true and lists running_commands. Default: 5000. " +
+                "Only THIS theory is watched: PIDE forks terminal proofs, so a diverging method in an imported theory " +
+                "does not block this one and goes unnoticed here; wait on (or check get_processing_status of) the import itself.")
             )
           ),
           "required" -> List("severity"),
@@ -1291,13 +1411,57 @@ class IQServer(
       ),
       Map(
         "name" -> "get_processing_status",
-        "description" -> "Get current PIDE processing status of a file: counts of unprocessed, running, finished, and failed commands.",
+        "description" -> ("Get current PIDE processing status of a file: counts of unprocessed, running, finished, and failed commands, " +
+          "plus running_commands (line, offset, elapsed_ms, source_preview of every command whose evaluation is running right now). " +
+          "A running_commands entry with ever-growing elapsed_ms locates a diverging proof method; cancel_command interrupts it."),
         "inputSchema" -> Map(
           "type" -> "object",
           "properties" -> Map(
             "path" -> Map(
               "type" -> "string",
               "description" -> "Path to the target theory file."
+            )
+          ),
+          "required" -> List("path"),
+          "additionalProperties" -> false
+        )
+      ),
+      Map(
+        "name" -> "cancel_command",
+        "description" -> ("Interrupt the running evaluation of commands in a theory (ML Execution.cancel), " +
+          "e.g. a diverging proof method reported in running_commands by get_processing_status or by a stalled wait. " +
+          "NOT sticky: PIDE re-runs a cancelled command at the next document update (any edit, perspective change or wait) " +
+          "while the file is visible or required. Use it to reclaim the prover immediately, then write_file the offending " +
+          "command - that supersedes it permanently."),
+        "inputSchema" -> Map(
+          "type" -> "object",
+          "properties" -> Map(
+            "path" -> Map(
+              "type" -> "string",
+              "description" -> "Path to the target theory file. Must be within configured mutation roots."
+            ),
+            "scope" -> Map(
+              "type" -> "string",
+              "description" -> ("'running' (default): cancel every currently running command in the file. " +
+                "'selection': cancel the single command chosen by command_selection."),
+              "enum" -> List("running", "selection")
+            ),
+            "command_selection" -> Map(
+              "type" -> "string",
+              "description" -> ("When scope='selection': " + commandSelectionDescription),
+              "enum" -> List("current", "file_offset", "file_pattern")
+            ),
+            "offset" -> Map(
+              "type" -> "integer",
+              "description" -> ("When scope='selection' and command_selection='file_offset': " + commandSelectionOffsetDescription)
+            ),
+            "pattern" -> Map(
+              "type" -> "string",
+              "description" -> ("When scope='selection' and command_selection='file_pattern': " + commandSelectionPatternDescription)
+            ),
+            "timeout" -> Map(
+              "type" -> "integer",
+              "description" -> "How long to wait (ms) for the targets to stop running before reporting. Default: 2000."
             )
           ),
           "required" -> List("path"),
@@ -1340,6 +1504,7 @@ class IQServer(
     "get_definitions" -> (params => handleGetDefinitions(params.toMap).map(McpToolResult.fromMap)),
     "get_diagnostics" -> (params => handleGetDiagnostics(params.toMap).map(McpToolResult.fromMap)),
     "get_processing_status" -> (params => handleGetProcessingStatus(params.toMap).map(McpToolResult.fromMap)),
+    "cancel_command" -> (params => handleCancelCommand(params.toMap).map(McpToolResult.fromMap)),
     "get_sorry_positions" -> (params => handleGetSorryPositions(params.toMap).map(McpToolResult.fromMap)),
     "explore" -> (params => handleExplore(params.toMap).map(McpToolResult.fromMap)),
     "save_file" -> (params => handleSaveFile(params.toMap).map(McpToolResult.fromMap)),
@@ -1720,6 +1885,7 @@ class IQServer(
     val startTime = System.currentTimeMillis()
     val node_name = model.node_name
     var commandInfos: List[CommandInfo] = List.empty
+    var waitStalled = false
 
     def retrieveCommands(): List[CommandInfo] = {
       val snapshot = PIDE.session.snapshot(node_name = node_name)
@@ -1739,15 +1905,6 @@ class IQServer(
         case _ => false
       }
 
-    def allStatusesProcessedOrRunning(statuses: List[CommandStatusSummary]): Boolean =
-      statuses.forall {
-        case CommandStatusSummary.Finished |
-            CommandStatusSummary.Canceled |
-            CommandStatusSummary.Failed |
-            CommandStatusSummary.Running => true
-        case _ => false
-      }
-
     if (!waitUntilProcessed) {
       Output.writeln(s"I/Q Server: wait_until_processed=false - single retrieval mode")
       commandInfos = retrieveCommands()
@@ -1760,35 +1917,16 @@ class IQServer(
 
       if (statuses.nonEmpty && !allStatusesProcessed(statuses)) {
         val latch = new CountDownLatch(1)
-        var checkCount = 0
-        var perCommandTimerStart: Option[Long] = None
+        @volatile var lastEventAtMs = System.currentTimeMillis()
 
         val consumer = Session.Consumer[Session.Commands_Changed](
           "IQServer.handleGetCommandCore"
         ) {
           case Session.Commands_Changed(_, nodes, _) if nodes.contains(node_name) =>
-            checkCount += 1
+            lastEventAtMs = System.currentTimeMillis()
             statuses = retrieveStatuses()
-
             if (statuses.isEmpty || allStatusesProcessed(statuses)) {
               latch.countDown()
-            } else {
-              if (allStatusesProcessedOrRunning(statuses) && perCommandTimerStart.isEmpty) {
-                perCommandTimerStart = Some(System.currentTimeMillis())
-              }
-
-              timeoutPerCommandMs match {
-                case Some(perCmdTimeout) =>
-                  perCommandTimerStart match {
-                    case Some(timerStart) =>
-                      val perCommandElapsed = System.currentTimeMillis() - timerStart
-                      if (perCommandElapsed >= perCmdTimeout) {
-                        latch.countDown()
-                      }
-                    case None =>
-                  }
-                case None =>
-              }
             }
           case _ =>
         }
@@ -1801,9 +1939,37 @@ class IQServer(
             latch.countDown()
           }
           val timeoutVal = timeoutMs.getOrElse(5000L)
-          val completed = latch.await(timeoutVal, TimeUnit.MILLISECONDS)
-          if (!completed) {
-            Output.writeln(s"I/Q Server: Wait timeout reached after ${timeoutVal}ms")
+          val deadline = startTime + timeoutVal
+
+          // Tick loop with a timer-driven stall detector (same rationale as
+          // in waitForTheoryCompletion: silent divergers emit no events, and a
+          // diverging non-forked step keeps the wait window unprocessed, so an
+          // event-driven check would never fire). The running count is taken
+          // at theory level because a command running *before* the window is
+          // exactly what blocks it.
+          var waiting = true
+          while (waiting) {
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining <= 0L) {
+              Output.writeln(s"I/Q Server: Wait timeout reached after ${timeoutVal}ms")
+              waiting = false
+            } else if (latch.await(math.min(waitTickMs, remaining), TimeUnit.MILLISECONDS)) {
+              waiting = false
+            } else {
+              statuses = retrieveStatuses()
+              if (statuses.isEmpty || allStatusesProcessed(statuses)) {
+                waiting = false
+              } else {
+                timeoutPerCommandMs.foreach { perCmdTimeout =>
+                  val quietMs = System.currentTimeMillis() - lastEventAtMs
+                  if (quietMs >= perCmdTimeout && runningCommandCount(node_name) >= 1) {
+                    Output.writeln(s"I/Q Server: Stall detected - command(s) running and no PIDE change for ${quietMs}ms (threshold ${perCmdTimeout}ms), aborting wait")
+                    waitStalled = true
+                    waiting = false
+                  }
+                }
+              }
+            }
           }
         } finally {
           PIDE.session.commands_changed -= consumer
@@ -1859,12 +2025,15 @@ class IQServer(
       )
     }
 
+    val runningCommands = if (waitStalled) runningCommandsInfo(model) else List.empty[Map[String, Any]]
     val summaryBuilder = scala.collection.mutable.Map[String, Any](
       "total_commands" -> commandInfosTrimmed.length,
       "commands_failed" -> failedCount,
       "commands_finished" -> finishedCount,
       "commands_canceled" -> canceledCount,
-      "commands_unprocessed" -> unfinishedCount
+      "commands_unprocessed" -> unfinishedCount,
+      "stalled" -> waitStalled,
+      "running_commands" -> runningCommands
     )
     authorizedXmlResultFile match {
       case Some(file: String) => summaryBuilder("xml_result_file") = file
@@ -1874,7 +2043,7 @@ class IQServer(
     val summary = summaryBuilder.toMap
 
     Output.writeln(s"I/Q Server: Generated command data with ${commandInfos.length} commands")
-    Right(GetCommandCoreResult(commandsData, summary))
+    Right(GetCommandCoreResult(commandsData, summary, waitStalled, runningCommands))
   }
 
   private def handleGetCommand(params: Map[String, Any]): Either[String, Map[String, Any]] = {
@@ -2185,22 +2354,27 @@ class IQServer(
     Output.writeln(s"I/Q Server: Getting document info for file: $filePath (errors: $includeErrors, warnings: $includeWarnings, timing_threshold: ${timingThresholdMs}ms, wait_until_processed: $waitUntilProcessed, timeout: ${timeout_ms} ms, timeout_per_command: ${timeoutPerCommandMs}ms)")
 
     // If wait_until_processed is requested and this is a theory file, wait for completion
-    if (waitUntilProcessed) {
-      val model = GUI_Thread.now { getFileContentAndModel(filePath) } match {
-        case (Some(_), Some(model)) => model
-        case _ => return Left(s"Could not get document information for file: $filePath")
-      }
+    val waitOutcome: Option[TheoryWaitOutcome] =
+      if (waitUntilProcessed) {
+        val model = GUI_Thread.now { getFileContentAndModel(filePath) } match {
+          case (Some(_), Some(model)) => model
+          case _ => return Left(s"Could not get document information for file: $filePath")
+        }
 
-      Output.writeln(s"I/Q Server: Requesting theory completion for: ${model.node_name}")
-      val _ = waitForTheoryCompletion(model, timeout_ms, timeoutPerCommandMs)
-    }
+        Output.writeln(s"I/Q Server: Requesting theory completion for: ${model.node_name}")
+        Some(waitForTheoryCompletion(model, timeout_ms, timeoutPerCommandMs))
+      } else None
 
     val documentInfo = GUI_Thread.now {
       getDocumentInfoForFile(filePath, includeErrors, includeWarnings, timingThresholdMs)
     }
 
     documentInfo match {
-      case Some(info) => Right(info)
+      case Some(info) =>
+        Right(waitOutcome match {
+          case Some(outcome) => info + ("wait" -> outcome.toMap)
+          case None => info
+        })
       case None => Left(s"Could not get document information for file: $filePath")
     }
   }
@@ -2336,7 +2510,8 @@ class IQServer(
             Map[String, Any](
               "line" -> start_line,
               "source_preview" -> cmd.source.take(50),
-              "timing_seconds" -> timingSeconds
+              "timing_seconds" -> timingSeconds,
+              "running" -> timings.has_running
             )
           )
       }
@@ -2846,7 +3021,9 @@ class IQServer(
       "edits_finished" -> rangeCount("commands_finished"),
       "edits_canceled" -> rangeCount("commands_canceled"),
       "edits_unprocessed" -> rangeCount("commands_unprocessed"),
-      "scope_resolved" -> scopeResolved.wire
+      "scope_resolved" -> scopeResolved.wire,
+      "stalled" -> coreResult.waitStalled,
+      "running_commands" -> coreResult.runningCommands
     )
 
     // Refresh post-edit content for file_summary, since wait may have
@@ -4125,9 +4302,9 @@ end"""
           )
       }
 
-      if (waitUntilProcessed) {
-        val _ = waitForTheoryCompletion(model, timeoutMs, timeoutPerCommandMs)
-      }
+      val waitOutcome: Option[TheoryWaitOutcome] =
+        if (waitUntilProcessed) Some(waitForTheoryCompletion(model, timeoutMs, timeoutPerCommandMs))
+        else None
 
       GUI_Thread.now {
         // Re-read content post-wait; processing may have happened on the EDT.
@@ -4143,17 +4320,19 @@ end"""
           Some(Line.Document(content))
         )
         val fileSummary = buildFileSummary(model, content)
-        Right(
-          Map(
-            "scope" -> "file",
-            "severity" -> parsedSeverity.wire,
-            "path" -> filePath,
-            "node_name" -> model.node_name.toString,
-            "count" -> diagnostics.length,
-            "diagnostics" -> diagnostics,
-            "file_summary" -> fileSummary
-          )
+        val base = Map[String, Any](
+          "scope" -> "file",
+          "severity" -> parsedSeverity.wire,
+          "path" -> filePath,
+          "node_name" -> model.node_name.toString,
+          "count" -> diagnostics.length,
+          "diagnostics" -> diagnostics,
+          "file_summary" -> fileSummary
         )
+        Right(waitOutcome match {
+          case Some(outcome) => base + ("wait" -> outcome.toMap)
+          case None => base
+        })
       }
     } else {
       val normalizedParams = withDefaultCurrentSelection(params)
@@ -4168,13 +4347,9 @@ end"""
           // For selection scope, file_summary still reflects the whole theory the
           // command lives in. Optionally drive that theory to completion first.
           val modelOpt = GUI_Thread.now { Document_Model.get_model(command.node_name) }
-          if (waitUntilProcessed) {
-            modelOpt match {
-              case Some(m) =>
-                val _ = waitForTheoryCompletion(m, timeoutMs, timeoutPerCommandMs)
-              case None =>
-            }
-          }
+          val waitOutcome: Option[TheoryWaitOutcome] =
+            if (waitUntilProcessed) modelOpt.map(m => waitForTheoryCompletion(m, timeoutMs, timeoutPerCommandMs))
+            else None
 
           GUI_Thread.now {
             val snapshot = PIDE.session.snapshot()
@@ -4207,9 +4382,13 @@ end"""
               "count" -> diagnostics.length,
               "diagnostics" -> diagnostics
             )
-            Right(fileSummary match {
+            val withFileSummary = fileSummary match {
               case Some(fs) => base + ("file_summary" -> fs)
               case None => base
+            }
+            Right(waitOutcome match {
+              case Some(outcome) => withFileSummary + ("wait" -> outcome.toMap)
+              case None => withFileSummary
             })
           }
         }
@@ -4834,10 +5013,114 @@ end"""
           "failed" -> nodeStatus.failed,
           "has_errors" -> (nodeStatus.failed > 0),
           "error_count" -> nodeStatus.failed,
-          "consolidated" -> nodeStatus.consolidated
+          "consolidated" -> nodeStatus.consolidated,
+          "running_commands" -> runningCommandsInfo(model)
         ))
       case _ => Left(s"File not tracked: $filePath")
     }
+  }
+
+  /** Sentence attached to every cancel_command result. */
+  private val cancelNotStickyNote: String =
+    "Cancellation is not sticky: PIDE re-runs a cancelled command at the next document update " +
+      "(any edit, perspective change or wait) while the file is visible or required. " +
+      "Edit the offending command with write_file to supersede it permanently."
+
+  /**
+   * Handles the cancel_command tool request.
+   * Interrupts the running evaluation of commands in a theory via Session.cancel_exec.
+   */
+  private def handleCancelCommand(params: Map[String, Any]): Either[String, Map[String, Any]] = {
+    val filePath = params.get("path").map(_.toString.trim).filter(_.nonEmpty) match {
+      case Some(path) =>
+        IQUtils.autoCompleteFilePath(path) match {
+          case Right(fullPath) =>
+            authorizeMutationPath("cancel_command", fullPath) match {
+              case Right(authorizedPath) => authorizedPath
+              case Left(errorMsg) => return Left(errorMsg)
+            }
+          case Left(errorMsg) => return Left(errorMsg)
+        }
+      case None => return Left("Missing required parameter: path")
+    }
+
+    val scope = params.get("scope").map(_.toString.trim).filter(_.nonEmpty).getOrElse("running")
+    if (scope != "running" && scope != "selection") {
+      return Left(s"Unknown scope '$scope'. Expected one of: running, selection")
+    }
+
+    val timeoutMs: Int = IQArgumentUtils.optionalIntParam(params, "timeout") match {
+      case Right(Some(v)) => v
+      case Right(None) => 2000
+      case Left(err) => return Left(err)
+    }
+
+    val model = GUI_Thread.now { getFileContentAndModel(filePath)._2 } match {
+      case Some(m) => m
+      case None => return Left(s"File not tracked: $filePath")
+    }
+    val node_name = model.node_name
+
+    def isRunning(cmd: Command): Boolean = {
+      val snapshot = PIDE.session.snapshot(node_name = node_name)
+      snapshot.state.command_status(snapshot.version, cmd).is_running
+    }
+
+    val targets: List[Command] = scope match {
+      case "running" =>
+        val snapshot = PIDE.session.snapshot(node_name = node_name)
+        val node = snapshot.get_node(node_name)
+        if (node == null) List.empty
+        else node.commands.iterator.filter(cmd => snapshot.state.command_status(snapshot.version, cmd).is_running).toList
+      case _ =>
+        decodeAndAuthorizeTargetSelection(params, "cancel_command").flatMap(resolveTargetSelection) match {
+          case Right(resolved) if resolved.command.node_name == node_name => List(resolved.command)
+          case Right(resolved) =>
+            return Left(s"Selected command belongs to ${resolved.command.node_name.node}, not to $filePath")
+          case Left(err) => return Left(err)
+        }
+    }
+
+    // Exec ids of the current assignment; there may be none yet (Try).
+    val execsByCommand: List[(Command, List[Document_ID.Exec])] = {
+      val snapshot = PIDE.session.snapshot(node_name = node_name)
+      targets.map { cmd =>
+        val execs = Try(snapshot.state.the_assignment(snapshot.version).command_execs.getOrElse(cmd.id, Nil))
+          .getOrElse(Nil)
+        (cmd, execs)
+      }
+    }
+
+    execsByCommand.foreach { case (_, execs) => execs.foreach(PIDE.session.cancel_exec) }
+    Output.writeln(s"I/Q Server: cancel_command($scope) on $filePath - ${targets.length} command(s), ${execsByCommand.map(_._2.length).sum} exec(s) cancelled")
+
+    // Poll until the targets stop running or the timeout elapses.
+    val deadline = System.currentTimeMillis() + timeoutMs
+    var stillRunning = targets.filter(isRunning)
+    while (stillRunning.nonEmpty && System.currentTimeMillis() < deadline) {
+      Thread.sleep(100L)
+      stillRunning = targets.filter(isRunning)
+    }
+
+    val node = PIDE.session.snapshot(node_name = node_name).get_node(node_name)
+    def describe(cmd: Command, execs: List[Document_ID.Exec]): Map[String, Any] = Map(
+      "line" -> (if (node == null) 0 else node.command_start_line(cmd).getOrElse(0)),
+      "offset" -> (if (node == null) 0 else node.command_start(cmd).getOrElse(0)),
+      "source_preview" -> sourcePreview(cmd.source),
+      "execs_canceled" -> execs.length
+    )
+    val stillRunningSet = stillRunning.toSet
+    val (stillRunningEntries, canceledEntries) =
+      execsByCommand.partition { case (cmd, _) => stillRunningSet.contains(cmd) }
+
+    Right(Map(
+      "path" -> filePath,
+      "scope" -> scope,
+      "canceled" -> canceledEntries.map { case (cmd, execs) => describe(cmd, execs) },
+      "still_running" -> stillRunningEntries.map { case (cmd, execs) => describe(cmd, execs) },
+      "all_stopped" -> stillRunning.isEmpty,
+      "note" -> cancelNotStickyNote
+    ))
   }
 
   /**
